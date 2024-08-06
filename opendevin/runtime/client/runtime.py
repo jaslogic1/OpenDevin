@@ -30,6 +30,7 @@ from opendevin.events.serialization import event_to_dict, observation_from_dict
 from opendevin.events.serialization.action import ACTION_TYPE_TO_CLASS
 from opendevin.runtime.plugins import PluginRequirement
 from opendevin.runtime.runtime import Runtime
+from opendevin.runtime.tools import RuntimeTool
 from opendevin.runtime.utils import find_available_tcp_port
 from opendevin.runtime.utils.runtime_build import build_runtime_image
 
@@ -70,8 +71,14 @@ class EventStreamRuntime(Runtime):
 
         self.container = None
         self.action_semaphore = asyncio.Semaphore(1)  # Ensure one action at a time
+        logger.debug(f'EventStreamRuntime `{sid}` config:\n{self.config}')
 
     async def ainit(self, env_vars: dict[str, str] | None = None):
+        if self.config.sandbox.od_runtime_extra_deps:
+            logger.info(
+                f'Installing extra user-provided dependencies in the runtime image: {self.config.sandbox.od_runtime_extra_deps}'
+            )
+
         self.container_image = build_runtime_image(
             self.container_image,
             self.docker_client,
@@ -79,6 +86,7 @@ class EventStreamRuntime(Runtime):
             # inside the container. This is useful when you want to test/debug the
             # latest code in the runtime docker container.
             update_source_code=self.config.sandbox.update_source_code,
+            extra_deps=self.config.sandbox.od_runtime_extra_deps,
         )
         self.container = await self._init_container(
             self.sandbox_workspace_dir,
@@ -136,12 +144,19 @@ class EventStreamRuntime(Runtime):
 
             if mount_dir is not None:
                 volumes = {mount_dir: {'bind': sandbox_workspace_dir, 'mode': 'rw'}}
+                logger.info(f'Mount dir: {sandbox_workspace_dir}')
             else:
                 logger.warn(
                     'Mount dir is not set, will not mount the workspace directory to the container.'
                 )
                 volumes = None
 
+            if self.config.sandbox.browsergym_eval_env is not None:
+                browsergym_arg = (
+                    f'--browsergym-eval-env {self.config.sandbox.browsergym_eval_env}'
+                )
+            else:
+                browsergym_arg = ''
             container = self.docker_client.containers.run(
                 self.container_image,
                 command=(
@@ -151,7 +166,8 @@ class EventStreamRuntime(Runtime):
                     f'--working-dir {sandbox_workspace_dir} '
                     f'{plugin_arg}'
                     f'--username {"opendevin" if self.config.run_as_devin else "root"} '
-                    f'--user-id {self.config.sandbox.user_id}'
+                    f'--user-id {self.config.sandbox.user_id} '
+                    f'{browsergym_arg}'
                 ),
                 network_mode=network_mode,
                 ports=port_mapping,
@@ -170,26 +186,25 @@ class EventStreamRuntime(Runtime):
             raise e
 
     async def _ensure_session(self):
+        await asyncio.sleep(1)
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(10),
-        wait=tenacity.wait_exponential(multiplier=2, min=4, max=600),
+        wait=tenacity.wait_exponential(multiplier=2, min=4, max=60),
     )
     async def _wait_until_alive(self):
+        logger.info('Reconnecting session')
         async with aiohttp.ClientSession() as session:
             async with session.get(f'{self.api_url}/alive') as response:
                 if response.status == 200:
                     return
                 else:
-                    logger.error(
-                        f'Action execution API is not alive. Response: {response}'
-                    )
-                    raise RuntimeError(
-                        f'Action execution API is not alive. Response: {response}'
-                    )
+                    msg = f'Action execution API is not alive. Response: {response}'
+                    logger.error(msg)
+                    raise RuntimeError(msg)
 
     @property
     def sandbox_workspace_dir(self):
@@ -278,12 +293,14 @@ class EventStreamRuntime(Runtime):
                     f'Action {action_type} is not supported in the current runtime.'
                 )
 
+            logger.info('Awaiting session')
             session = await self._ensure_session()
             await self._wait_until_alive()
 
             assert action.timeout is not None
 
             try:
+                logger.info('Executing command')
                 async with session.post(
                     f'{self.api_url}/execute_action',
                     json={'action': event_to_dict(action)},
@@ -334,3 +351,11 @@ class EventStreamRuntime(Runtime):
         raise NotImplementedError(
             'This method is not implemented in the runtime client.'
         )
+
+    def init_runtime_tools(
+        self,
+        runtime_tools: list[RuntimeTool],
+        runtime_tools_config: Optional[dict[RuntimeTool, Any]] = None,
+    ) -> None:
+        # TODO: deprecate this method when we move to the new EventStreamRuntime
+        logger.warning('init_runtime_tools is not implemented in the runtime client.')
