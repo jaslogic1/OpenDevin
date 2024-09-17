@@ -1,12 +1,16 @@
 [tool.poetry]
-name = "opendevin"
-version = "0.8.3"
-description = "OpenDevin: Code Less, Make More"
-authors = ["OpenDevin"]
+name = "openhands-ai"
+version = "0.9.3"
+description = "OpenHands: Code Less, Make More"
+authors = ["OpenHands"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/OpenDevin/OpenDevin"
+repository = "https://github.com/All-Hands-AI/OpenHands"
 include = ["poetry.lock"]
+packages = [
+  { include = "agenthub/**/*" },
+  { include = "openhands/**/*" }
+]
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -23,25 +27,33 @@ uvicorn = "*"
 types-toml = "*"
 numpy = "*"
 json-repair = "*"
-browsergym = "0.3.4" # integrate browsergym as the browsing interface
+browsergym = "0.6.0" # integrate browsergym as the browsing interface
 html2text = "*"
 e2b = "^0.17.1"
 pexpect = "*"
 jinja2 = "^3.1.3"
 python-multipart = "*"
 boto3 = "*"
-minio = "^7.2.7"
+minio = "^7.2.8"
 gevent = "^24.2.1"
 pyarrow = "17.0.0" # transitive dependency, pinned here to avoid conflicts
 tenacity = "^8.5.0"
-zope-interface = "6.4.post2"
+zope-interface = "7.0.3"
 pathspec = "^0.12.1"
 google-cloud-aiplatform = "*"
+anthropic = {extras = ["vertex"], version = "*"}
 grep-ast = "0.3.3"
 tree-sitter = "0.21.3"
 bashlex = "^0.18"
 pyjwt = "^2.9.0"
 dirhash = "*"
+python-frontmatter = "^1.1.0"
+python-docx = "*"
+PyPDF2 = "*"
+python-pptx = "*"
+pylatexenc = "*"
+tornado = "*"
+python-dotenv = "*"
 
 debugpy = "^1.8.2"
 requests = "^2.32.3"
@@ -55,8 +67,8 @@ llama-index-embeddings-azure-openai = "*"
 llama-index-embeddings-ollama = "*"
 
 [tool.poetry.group.dev.dependencies]
-ruff = "0.5.5"
-mypy = "1.11.1"
+ruff = "0.6.4"
+mypy = "1.11.2"
 pre-commit = "3.8.0"
 build = "*"
 
@@ -65,12 +77,9 @@ pytest = "*"
 pytest-cov = "*"
 pytest-asyncio = "*"
 pytest-forked = "*"
+pytest-xdist = "*"
 flake8 = "*"
 openai = "*"
-python-docx = "*"
-PyPDF2 = "*"
-pylatexenc = "*"
-python-pptx = "*"
 opencv-python = "*"
 pandas = "*"
 reportlab = "*"
@@ -84,10 +93,6 @@ jupyterlab = "*"
 notebook = "*"
 jupyter_kernel_gateway = "*"
 flake8 = "*"
-python-docx = "*"
-PyPDF2 = "*"
-python-pptx = "*"
-pylatexenc = "*"
 opencv-python = "*"
 
 
@@ -119,4 +124,9 @@ streamlit = "*"
 whatthepatch = "*"
 retry = "*"
 evaluate = "*"
-swebench = { git = "https://github.com/OpenDevin/SWE-bench.git" }
+swebench = { git = "https://github.com/All-Hands-AI/SWE-bench.git" }
+func_timeout = "*"
+sympy = "*"
+gdown = "*"
+matplotlib = "*"
+seaborn = "*"
