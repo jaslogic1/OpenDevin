@@ -141,14 +141,23 @@ def prep_docker_build_folder(
         file.write(dockerfile_content)
 
     # Get the MD5 hash of the dir_path directory
-    dist_hash = dirhash(dir_path, 'md5')
+    dir_hash = dirhash(
+        dir_path,
+        'md5',
+        ignore=[
+            '.*/',  # hidden directories
+            '__pycache__/',
+            '*.pyc',
+        ],
+    )
+    hash = f'v{oh_version}_{dir_hash}'
     logger.info(
         f'Input base image: {base_image}\n'
         f'Skip init: {skip_init}\n'
         f'Extra deps: {extra_deps}\n'
-        f'Hash for docker build directory [{dir_path}] (contents: {os.listdir(dir_path)}): {dist_hash}\n'
+        f'Hash for docker build directory [{dir_path}] (contents: {os.listdir(dir_path)}): {hash}\n'
     )
-    return dist_hash
+    return hash
 
 
 def get_runtime_image_repo_and_tag(base_image: str) -> tuple[str, str]:
@@ -356,10 +365,16 @@ def _build_sandbox_image(
     target_image_hash_name = f'{target_image_repo}:{target_image_hash_tag}'
     target_image_generic_name = f'{target_image_repo}:{target_image_tag}'
 
+    tags_to_add = [target_image_hash_name]
+
+    # Only add the generic tag if the image does not exist
+    # so it does not get overwritten & only points to the earliest version
+    # to avoid "too many layers" after many re-builds
+    if not runtime_builder.image_exists(target_image_generic_name):
+        tags_to_add.append(target_image_generic_name)
+
     try:
-        image_name = runtime_builder.build(
-            path=docker_folder, tags=[target_image_hash_name, target_image_generic_name]
-        )
+        image_name = runtime_builder.build(path=docker_folder, tags=tags_to_add)
         if not image_name:
             raise RuntimeError(f'Build failed for image {target_image_hash_name}')
     except Exception as e:
