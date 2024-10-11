@@ -9,6 +9,11 @@ on:
     - main
   pull_request:
 
+# If triggered by a PR, it will be in the same group. However, each commit on main will be in its own unique group
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.head_ref && github.ref) || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -36,7 +41,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'poetry'
       - name: Install Python dependencies using Poetry
         run: poetry install --without evaluation,llama-index
@@ -45,7 +50,7 @@ jobs:
       - name: Run tests
         run: |
           set -e
-          poetry run python3 openhands/core/main.py -t "do a flip" -d ./workspace/ -c DummyAgent
+          SANDBOX_FORCE_REBUILD_RUNTIME=True poetry run python3 openhands/core/main.py -t "do a flip" -d ./workspace/ -c DummyAgent
       - name: Check exit code
         run: |
           if [ $? -ne 0 ]; then

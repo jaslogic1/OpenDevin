@@ -35,7 +35,9 @@ from openhands.runtime.builder import DockerRuntimeBuilder
 from openhands.runtime.plugins import PluginRequirement
 from openhands.runtime.runtime import Runtime
 from openhands.runtime.utils import find_available_tcp_port
+from openhands.runtime.utils.request import send_request_with_retry
 from openhands.runtime.utils.runtime_build import build_runtime_image
+from openhands.utils.tenacity_stop import stop_if_should_exit
 
 
 class LogBuffer:
@@ -126,9 +128,7 @@ class EventStreamRuntime(Runtime):
         self.config = config
         self._host_port = 30000  # initial dummy value
         self._container_port = 30001  # initial dummy value
-        self.api_url = (
-            f'http://{self.config.sandbox.api_hostname}:{self._container_port}'
-        )
+        self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
         self.session = requests.Session()
         self.instance_id = (
             sid + '_' + str(uuid.uuid4()) if sid is not None else str(uuid.uuid4())
@@ -168,6 +168,7 @@ class EventStreamRuntime(Runtime):
                 self.base_container_image,
                 self.runtime_builder,
                 extra_deps=self.config.sandbox.runtime_extra_deps,
+                force_rebuild=self.config.sandbox.force_rebuild_runtime,
             )
         self.container = self._init_container(
             sandbox_workspace_dir=self.config.workspace_mount_path_in_sandbox,  # e.g. /workspace
@@ -203,7 +204,7 @@ class EventStreamRuntime(Runtime):
             raise ex
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(5),
+        stop=tenacity.stop_after_attempt(5) | stop_if_should_exit(),
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
     )
     def _init_container(
@@ -226,7 +227,7 @@ class EventStreamRuntime(Runtime):
                 self._host_port
             )  # in future this might differ from host port
             self.api_url = (
-                f'http://{self.config.sandbox.api_hostname}:{self._container_port}'
+                f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
             )
 
             use_host_network = self.config.sandbox.use_host_network
@@ -274,7 +275,7 @@ class EventStreamRuntime(Runtime):
             container = self.docker_client.containers.run(
                 self.runtime_container_image,
                 command=(
-                    f'/openhands/miniforge3/bin/mamba run --no-capture-output -n base '
+                    f'/openhands/micromamba/bin/micromamba run -n openhands '
                     f'poetry run '
                     f'python -u -m openhands.runtime.client.client {self._container_port} '
                     f'--working-dir "{sandbox_workspace_dir}" '
@@ -324,7 +325,7 @@ class EventStreamRuntime(Runtime):
             )
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(10),
+        stop=tenacity.stop_after_delay(120) | stop_if_should_exit(),
         wait=tenacity.wait_exponential(multiplier=2, min=1, max=20),
         reraise=(ConnectionRefusedError,),
     )
@@ -333,7 +334,13 @@ class EventStreamRuntime(Runtime):
         if not (self.log_buffer and self.log_buffer.client_ready):
             raise RuntimeError('Runtime client is not ready.')
 
-        response = self.session.get(f'{self.api_url}/alive')
+        response = send_request_with_retry(
+            self.session,
+            'GET',
+            f'{self.api_url}/alive',
+            retry_exceptions=[ConnectionRefusedError],
+            timeout=300,  # 5 minutes gives the container time to be alive 🧟‍♂️
+        )
         if response.status_code == 200:
             return
         else:
@@ -416,7 +423,9 @@ class EventStreamRuntime(Runtime):
             assert action.timeout is not None
 
             try:
-                response = self.session.post(
+                response = send_request_with_retry(
+                    self.session,
+                    'POST',
                     f'{self.api_url}/execute_action',
                     json={'action': event_to_dict(action)},
                     timeout=action.timeout,
@@ -430,13 +439,15 @@ class EventStreamRuntime(Runtime):
                     logger.debug(f'response: {response}')
                     error_message = response.text
                     logger.error(f'Error from server: {error_message}')
-                    obs = ErrorObservation(f'Command execution failed: {error_message}')
+                    obs = ErrorObservation(f'Action execution failed: {error_message}')
             except requests.Timeout:
                 logger.error('No response received within the timeout period.')
-                obs = ErrorObservation('Command execution timed out')
+                obs = ErrorObservation(
+                    f'Action execution timed out after {action.timeout} seconds.'
+                )
             except Exception as e:
-                logger.error(f'Error during command execution: {e}')
-                obs = ErrorObservation(f'Command execution failed: {str(e)}')
+                logger.error(f'Error during action execution: {e}')
+                obs = ErrorObservation(f'Action execution failed: {str(e)}')
             self._refresh_logs()
             return obs
 
@@ -493,8 +504,13 @@ class EventStreamRuntime(Runtime):
 
             params = {'destination': sandbox_dest, 'recursive': str(recursive).lower()}
 
-            response = self.session.post(
-                f'{self.api_url}/upload_file', files=upload_data, params=params
+            response = send_request_with_retry(
+                self.session,
+                'POST',
+                f'{self.api_url}/upload_file',
+                files=upload_data,
+                params=params,
+                timeout=300,
             )
             if response.status_code == 200:
                 return
@@ -523,7 +539,13 @@ class EventStreamRuntime(Runtime):
             if path is not None:
                 data['path'] = path
 
-            response = self.session.post(f'{self.api_url}/list_files', json=data)
+            response = send_request_with_retry(
+                self.session,
+                'POST',
+                f'{self.api_url}/list_files',
+                json=data,
+                timeout=30,  # 30 seconds because the container should already be alive
+            )
             if response.status_code == 200:
                 response_json = response.json()
                 assert isinstance(response_json, list)
@@ -535,6 +557,30 @@ class EventStreamRuntime(Runtime):
             raise TimeoutError('List files operation timed out')
         except Exception as e:
             raise RuntimeError(f'List files operation failed: {str(e)}')
+
+    def copy_from(self, path: str) -> bytes:
+        """Zip all files in the sandbox and return as a stream of bytes."""
+        self._refresh_logs()
+        try:
+            params = {'path': path}
+            response = send_request_with_retry(
+                self.session,
+                'GET',
+                f'{self.api_url}/download_files',
+                params=params,
+                stream=True,
+                timeout=30,
+            )
+            if response.status_code == 200:
+                data = response.content
+                return data
+            else:
+                error_message = response.text
+                raise Exception(f'Copy operation failed: {error_message}')
+        except requests.Timeout:
+            raise TimeoutError('Copy operation timed out')
+        except Exception as e:
+            raise RuntimeError(f'Copy operation failed: {str(e)}')
 
     def _is_port_in_use_docker(self, port):
         containers = self.docker_client.containers.list()

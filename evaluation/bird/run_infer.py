@@ -75,7 +75,7 @@ def get_config(
         runtime='eventstream',
         max_iterations=metadata.max_iterations,
         sandbox=SandboxConfig(
-            base_container_image='python:3.11-bookworm',
+            base_container_image='python:3.12-bookworm',
             enable_auto_lint=True,
             use_host_network=False,
         ),
@@ -402,14 +402,14 @@ def process_instance(
     # NOTE: You can actually set slightly different instruction for different agents
     instruction += AGENT_CLS_TO_INST_SUFFIX[metadata.agent_class]
 
-    runtime = create_runtime(config, sid=instance_id)
+    runtime = create_runtime(config)
     initialize_runtime(runtime, instance)
 
     # Here's how you can run the agent (similar to the `main` function) and get the final task state
     state: State | None = asyncio.run(
         run_controller(
             config=config,
-            task_str=instruction,
+            initial_user_action=MessageAction(content=instruction),
             fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
                 metadata.agent_class
             ],

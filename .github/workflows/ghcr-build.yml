@@ -1,11 +1,5 @@
-# Workflow that builds, tests and then pushes the runtime docker images to the ghcr.io repository
+# Workflow that builds, tests and then pushes the OpenHands and runtime docker images to the ghcr.io repository
 name: Build, Test and Publish RT Image
-
-# Only run one workflow of the same group at a time.
-# There can be at most one running and one pending job in a concurrency group at any time.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Always run on "main"
 # Always run on tags
@@ -25,8 +19,14 @@ on:
         required: true
         default: ''
 
+# If triggered by a PR, it will be in the same group. However, each commit on main will be in its own unique group
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.head_ref && github.ref) || github.run_id }}
+  cancel-in-progress: true
+
 env:
-  BASE_IMAGE_FOR_HASH_EQUIVALENCE_TEST: nikolaik/python-nodejs:python3.11-nodejs22
+  BASE_IMAGE_FOR_HASH_EQUIVALENCE_TEST: nikolaik/python-nodejs:python3.12-nodejs22
+  RELEVANT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   # Builds the OpenHands Docker images
@@ -71,11 +71,11 @@ jobs:
       - name: Build and push app image
         if: "!github.event.pull_request.head.repo.fork"
         run: |
-          ./containers/build.sh openhands ${{ github.repository_owner }} --push
+          ./containers/build.sh -i openhands -o ${{ github.repository_owner }} --push
       - name: Build app image
         if: "github.event.pull_request.head.repo.fork"
         run: |
-          ./containers/build.sh openhands image ${{ github.repository_owner }}
+          ./containers/build.sh -i openhands -o ${{ github.repository_owner }} --load
       - name: Get hash in App Image
         id: get_hash_in_app_image
         run: |
@@ -83,12 +83,19 @@ jobs:
           export REPO_OWNER=${{ github.repository_owner }}
           REPO_OWNER=$(echo $REPO_OWNER | tr '[:upper:]' '[:lower:]')
           # Run the build script in the app image
-          docker run -e SANDBOX_USER_ID=0 -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/${REPO_OWNER}/openhands:${{ github.sha }} /bin/bash -c "mkdir -p containers/runtime; python3 openhands/runtime/utils/runtime_build.py --base_image ${{ env.BASE_IMAGE_FOR_HASH_EQUIVALENCE_TEST }} --build_folder containers/runtime --force_rebuild" 2>&1 | tee docker-outputs.txt
+          docker run -e SANDBOX_USER_ID=0 -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/${REPO_OWNER}/openhands:${{ env.RELEVANT_SHA }} /bin/bash -c "mkdir -p containers/runtime; python3 openhands/runtime/utils/runtime_build.py --base_image ${{ env.BASE_IMAGE_FOR_HASH_EQUIVALENCE_TEST }} --build_folder containers/runtime --force_rebuild" 2>&1 | tee docker-outputs.txt
           # Get the hash from the build script
           hash_from_app_image=$(cat docker-outputs.txt | grep "Hash for docker build directory" | awk -F "): " '{print $2}' | uniq | head -n1)
           echo "hash_from_app_image=$hash_from_app_image" >> $GITHUB_OUTPUT
           echo "Hash from app image: $hash_from_app_image"
+      # This test should move when we have a test suite for the app image
+      - name: Test docker in App Image
+        run: |
+          # Lowercase the repository owner
+          export REPO_OWNER=${{ github.repository_owner }}
+          REPO_OWNER=$(echo $REPO_OWNER | tr '[:upper:]' '[:lower:]')
 
+          docker run -e SANDBOX_USER_ID=0 -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/${REPO_OWNER}/openhands:${{ env.RELEVANT_SHA }} /bin/bash -c "docker run hello-world"
 
   # Builds the runtime Docker images
   ghcr_build_runtime:
@@ -100,7 +107,7 @@ jobs:
     strategy:
       matrix:
         base_image:
-          - image: 'nikolaik/python-nodejs:python3.11-nodejs22'
+          - image: 'nikolaik/python-nodejs:python3.12-nodejs22'
             tag: nikolaik
     steps:
       - name: Checkout
@@ -135,7 +142,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Cache Poetry dependencies
         uses: actions/cache@v4
         with:
@@ -154,13 +161,13 @@ jobs:
       - name: Build and push runtime image ${{ matrix.base_image.image }}
         if: github.event.pull_request.head.repo.fork != true
         run: |
-          ./containers/build.sh runtime ${{ github.repository_owner }} --push ${{ matrix.base_image.tag }}
+          ./containers/build.sh -i runtime -o ${{ github.repository_owner }} --push -t ${{ matrix.base_image.tag }}
       # Forked repos can't push to GHCR, so we need to upload the image as an artifact
       - name: Build runtime image ${{ matrix.base_image.image }} for fork
         if: github.event.pull_request.head.repo.fork
         uses: docker/build-push-action@v6
         with:
-          tags: ghcr.io/all-hands-ai/runtime:${{ github.sha }}-${{ matrix.base_image.tag }}
+          tags: ghcr.io/all-hands-ai/runtime:${{ env.RELEVANT_SHA }}-${{ matrix.base_image.tag }}
           outputs: type=docker,dest=/tmp/runtime-${{ matrix.base_image.tag }}.tar
           context: containers/runtime
       - name: Upload runtime image for fork
@@ -192,7 +199,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install poetry via pipx
         run: pipx install poetry
       - name: Install Python dependencies using Poetry
@@ -271,7 +278,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install poetry via pipx
         run: pipx install poetry
       - name: Install Python dependencies using Poetry
@@ -284,7 +291,7 @@ jobs:
           # Install to be able to retry on failures for flaky tests
           poetry run pip install pytest-rerunfailures
 
-          image_name=ghcr.io/${{ github.repository_owner }}/runtime:${{ github.sha }}-${{ matrix.base_image }}
+          image_name=ghcr.io/${{ github.repository_owner }}/runtime:${{ env.RELEVANT_SHA }}-${{ matrix.base_image }}
           image_name=$(echo $image_name | tr '[:upper:]' '[:lower:]')
 
           SKIP_CONTAINER_LOGS=true \
@@ -293,7 +300,7 @@ jobs:
           SANDBOX_RUNTIME_CONTAINER_IMAGE=$image_name \
           TEST_IN_CI=true \
           RUN_AS_OPENHANDS=false \
-          poetry run pytest -n 3 -raR --reruns 1 --reruns-delay 3 --cov=agenthub --cov=openhands --cov-report=xml -s ./tests/runtime
+          poetry run pytest -n 3 -raRs --reruns 2 --reruns-delay 5 --cov=openhands --cov-report=xml -s ./tests/runtime
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         env:
@@ -349,7 +356,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install poetry via pipx
         run: pipx install poetry
       - name: Install Python dependencies using Poetry
@@ -362,7 +369,7 @@ jobs:
           # Install to be able to retry on failures for flaky tests
           poetry run pip install pytest-rerunfailures
 
-          image_name=ghcr.io/${{ github.repository_owner }}/runtime:${{ github.sha }}-${{ matrix.base_image }}
+          image_name=ghcr.io/${{ github.repository_owner }}/runtime:${{ env.RELEVANT_SHA }}-${{ matrix.base_image }}
           image_name=$(echo $image_name | tr '[:upper:]' '[:lower:]')
 
           SKIP_CONTAINER_LOGS=true \
@@ -371,7 +378,7 @@ jobs:
           SANDBOX_RUNTIME_CONTAINER_IMAGE=$image_name \
           TEST_IN_CI=true \
           RUN_AS_OPENHANDS=true \
-          poetry run pytest -n 3 -raR --reruns 1 --reruns-delay 3 --cov=agenthub --cov=openhands --cov-report=xml -s ./tests/runtime
+          poetry run pytest -n 3 -raRs --reruns 2 --reruns-delay 5 --cov=openhands --cov-report=xml -s ./tests/runtime
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         env:
@@ -428,14 +435,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install poetry via pipx
         run: pipx install poetry
       - name: Install Python dependencies using Poetry
         run: make install-python-dependencies
       - name: Run integration tests
         run: |
-          image_name=ghcr.io/${{ github.repository_owner }}/runtime:${{ github.sha }}-${{ matrix.base_image }}
+          image_name=ghcr.io/${{ github.repository_owner }}/runtime:${{ env.RELEVANT_SHA }}-${{ matrix.base_image }}
           image_name=$(echo $image_name | tr '[:upper:]' '[:lower:]')
 
           TEST_RUNTIME=eventstream \

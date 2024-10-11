@@ -10,6 +10,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from openhands.utils.tenacity_stop import stop_if_should_exit
+
 
 def is_server_error(exception):
     return (
@@ -31,13 +33,13 @@ DEFAULT_RETRY_EXCEPTIONS = [
 ]
 
 
-def send_request(
+def send_request_with_retry(
     session: requests.Session,
     method: str,
     url: str,
+    timeout: int,
     retry_exceptions: list[Type[Exception]] | None = None,
     retry_fns: list[Callable[[Exception], bool]] | None = None,
-    timeout: int = 120,
     **kwargs: Any,
 ) -> requests.Response:
     exceptions_to_catch = retry_exceptions or DEFAULT_RETRY_EXCEPTIONS
@@ -47,11 +49,12 @@ def send_request(
     if retry_fns is not None:
         for fn in retry_fns:
             retry_condition |= retry_if_exception(fn)
-    kwargs["timeout"] = timeout
+    # wait a few more seconds to get the timeout error from client side
+    kwargs['timeout'] = timeout + 10
 
     @retry(
-        stop=stop_after_delay(timeout),
-        wait=wait_exponential(multiplier=1, min=4, max=60),
+        stop=stop_after_delay(timeout) | stop_if_should_exit(),
+        wait=wait_exponential(multiplier=1, min=4, max=20),
         retry=retry_condition,
         reraise=True,
     )

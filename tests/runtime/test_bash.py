@@ -13,6 +13,7 @@ from conftest import (
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import CmdRunAction
 from openhands.events.observation import CmdOutputObservation
+from openhands.runtime.runtime import Runtime
 
 # ============================================================================================================================
 # Bash-specific tests
@@ -53,6 +54,198 @@ def test_bash_command_pexcept(temp_dir, box_class, run_as_openhands):
             obs, CmdOutputObservation
         ), 'The observation should be a CmdOutputObservation.'
         assert obs.exit_code == 0, 'The exit code should be 0.'
+    finally:
+        _close_test_runtime(runtime)
+
+
+def test_bash_timeout_and_keyboard_interrupt(temp_dir, box_class, run_as_openhands):
+    runtime = _load_runtime(temp_dir, box_class, run_as_openhands)
+    try:
+        action = CmdRunAction(command='python -c "import time; time.sleep(10)"')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert isinstance(obs, CmdOutputObservation)
+        assert (
+            '[Command timed out after 1 seconds. SIGINT was sent to interrupt the command.]'
+            in obs.content
+        )
+        assert 'KeyboardInterrupt' in obs.content
+
+        # follow up command should not be affected
+        action = CmdRunAction(command='ls')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+        # run it again!
+        action = CmdRunAction(command='python -c "import time; time.sleep(10)"')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        assert (
+            '[Command timed out after 1 seconds. SIGINT was sent to interrupt the command.]'
+            in obs.content
+        )
+        assert 'KeyboardInterrupt' in obs.content
+
+        # things should still work
+        action = CmdRunAction(command='ls')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        assert '/workspace' in obs.content
+
+    finally:
+        _close_test_runtime(runtime)
+
+
+def test_bash_pexcept_eof(temp_dir, box_class, run_as_openhands):
+    runtime = _load_runtime(temp_dir, box_class, run_as_openhands)
+    try:
+        action = CmdRunAction(command='python3 -m http.server 8080')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 130  # script was killed by SIGINT
+        assert 'Serving HTTP on 0.0.0.0 port 8080' in obs.content
+        assert 'Keyboard interrupt received, exiting.' in obs.content
+
+        action = CmdRunAction(command='ls')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        assert '/workspace' in obs.content
+
+        # run it again!
+        action = CmdRunAction(command='python3 -m http.server 8080')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 130  # script was killed by SIGINT
+        assert 'Serving HTTP on 0.0.0.0 port 8080' in obs.content
+        assert 'Keyboard interrupt received, exiting.' in obs.content
+
+        # things should still work
+        action = CmdRunAction(command='ls')
+        action.timeout = 1
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        assert '/workspace' in obs.content
+    finally:
+        _close_test_runtime(runtime)
+
+
+def test_process_resistant_to_one_sigint(temp_dir, box_class, run_as_openhands):
+    runtime = _load_runtime(temp_dir, box_class, run_as_openhands)
+    try:
+        # Create a bash script that ignores SIGINT up to 1 times
+        script_content = """
+#!/bin/bash
+trap_count=0
+trap 'echo "Caught SIGINT ($((++trap_count))/1), ignoring..."; [ $trap_count -ge 1 ] && trap - INT && exit' INT
+while true; do
+    echo "Still running..."
+    sleep 1
+done
+        """.strip()
+
+        with open(f'{temp_dir}/resistant_script.sh', 'w') as f:
+            f.write(script_content)
+        os.chmod(f'{temp_dir}/resistant_script.sh', 0o777)
+
+        runtime.copy_to(
+            os.path.join(temp_dir, 'resistant_script.sh'),
+            runtime.config.workspace_mount_path_in_sandbox,
+        )
+
+        # Run the resistant script
+        action = CmdRunAction(command='sudo bash ./resistant_script.sh')
+        action.timeout = 5
+        action.blocking = True
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 130  # script was killed by SIGINT
+        assert 'Still running...' in obs.content
+        assert 'Caught SIGINT (1/1), ignoring...' in obs.content
+        assert 'Stopped' not in obs.content
+        assert (
+            '[Command timed out after 5 seconds. SIGINT was sent to interrupt the command.]'
+            in obs.content
+        )
+
+        # Normal command should still work
+        action = CmdRunAction(command='ls')
+        action.timeout = 10
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        assert '/workspace' in obs.content
+        assert 'resistant_script.sh' in obs.content
+
+    finally:
+        _close_test_runtime(runtime)
+
+
+def test_process_resistant_to_multiple_sigint(temp_dir, box_class, run_as_openhands):
+    runtime = _load_runtime(temp_dir, box_class, run_as_openhands)
+    try:
+        # Create a bash script that ignores SIGINT up to 2 times
+        script_content = """
+#!/bin/bash
+trap_count=0
+trap 'echo "Caught SIGINT ($((++trap_count))/3), ignoring..."; [ $trap_count -ge 3 ] && trap - INT && exit' INT
+while true; do
+    echo "Still running..."
+    sleep 1
+done
+        """.strip()
+
+        with open(f'{temp_dir}/resistant_script.sh', 'w') as f:
+            f.write(script_content)
+        os.chmod(f'{temp_dir}/resistant_script.sh', 0o777)
+
+        runtime.copy_to(
+            os.path.join(temp_dir, 'resistant_script.sh'),
+            runtime.config.workspace_mount_path_in_sandbox,
+        )
+
+        # Run the resistant script
+        action = CmdRunAction(command='sudo bash ./resistant_script.sh')
+        action.timeout = 2
+        action.blocking = True
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        assert 'Still running...' in obs.content
+        assert 'Caught SIGINT (1/3), ignoring...' in obs.content
+        assert '[1]+' and 'Stopped' in obs.content
+        assert (
+            '[Command timed out after 2 seconds. SIGINT was sent to interrupt the command, but failed. The command was killed.]'
+            in obs.content
+        )
+
+        # Normal command should still work
+        action = CmdRunAction(command='ls')
+        action.timeout = 10
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        assert obs.exit_code == 0
+        assert '/workspace' in obs.content
+        assert 'resistant_script.sh' in obs.content
+
     finally:
         _close_test_runtime(runtime)
 
@@ -376,6 +569,26 @@ def test_copy_non_existent_file(temp_dir, box_class):
 
         obs = _run_cmd_action(runtime, f'ls {sandbox_dir}/should_not_exist.txt')
         assert obs.exit_code != 0  # File should not exist
+    finally:
+        _close_test_runtime(runtime)
+
+
+def test_copy_from_directory(temp_dir, box_class):
+    runtime: Runtime = _load_runtime(temp_dir, box_class)
+    sandbox_dir = _get_sandbox_folder(runtime)
+    try:
+        temp_dir_copy = os.path.join(temp_dir, 'test_dir')
+        # We need a separate directory, since temp_dir is mounted to /workspace
+        _create_host_test_dir_with_files(temp_dir_copy)
+
+        # Initial state
+        runtime.copy_to(temp_dir_copy, sandbox_dir, recursive=True)
+
+        path_to_copy_from = f'{sandbox_dir}/test_dir'
+        result = runtime.copy_from(path=path_to_copy_from)
+
+        # Result is returned in bytes
+        assert isinstance(result, bytes)
     finally:
         _close_test_runtime(runtime)
 
