@@ -29,7 +29,6 @@ from fastapi import (
     WebSocket,
     status,
 )
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -54,8 +53,9 @@ from openhands.events.observation import (
 )
 from openhands.events.serialization import event_to_dict
 from openhands.llm import bedrock
-from openhands.runtime.runtime import Runtime
+from openhands.runtime.base import Runtime
 from openhands.server.auth import get_sid_from_token, sign_token
+from openhands.server.middleware import LocalhostCORSMiddleware, NoCacheMiddleware
 from openhands.server.session import SessionManager
 
 load_dotenv()
@@ -63,6 +63,24 @@ load_dotenv()
 config = load_app_config()
 file_store = get_file_store(config.file_store, config.file_store_path)
 session_manager = SessionManager(config, file_store)
+
+GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID', '').strip()
+GITHUB_CLIENT_SECRET = os.getenv('GITHUB_CLIENT_SECRET', '').strip()
+
+# New global variable to store the user list
+GITHUB_USER_LIST = None
+
+
+# New function to load the user list
+def load_github_user_list():
+    global GITHUB_USER_LIST
+    waitlist = os.getenv('GITHUB_USER_LIST_FILE')
+    if waitlist:
+        with open(waitlist, 'r') as f:
+            GITHUB_USER_LIST = [line.strip() for line in f if line.strip()]
+
+
+load_github_user_list()
 
 
 @asynccontextmanager
@@ -74,12 +92,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=['http://localhost:3001', 'http://127.0.0.1:3001'],
+    LocalhostCORSMiddleware,
     allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
+
+app.add_middleware(NoCacheMiddleware)
 
 security_scheme = HTTPBearer()
 
@@ -180,9 +200,14 @@ async def attach_session(request: Request, call_next):
     Returns:
         Response: The response from the next middleware or route handler.
     """
-    if request.url.path.startswith('/api/options/') or not request.url.path.startswith(
-        '/api/'
-    ):
+    non_authed_paths = [
+        '/api/options/',
+        '/api/github/callback',
+        '/api/authenticate',
+    ]
+    if any(
+        request.url.path.startswith(path) for path in non_authed_paths
+    ) or not request.url.path.startswith('/api/'):
         response = await call_next(request)
         return response
 
@@ -211,16 +236,18 @@ async def attach_session(request: Request, call_next):
             content={'error': 'Invalid token'},
         )
 
-    request.state.conversation = await call_sync_from_async(
-        session_manager.attach_to_conversation, request.state.sid
+    request.state.conversation = await session_manager.attach_to_conversation(
+        request.state.sid
     )
     if request.state.conversation is None:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={'error': 'Session not found'},
         )
-
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        await session_manager.detach_from_conversation(request.state.conversation)
     return response
 
 
@@ -254,7 +281,7 @@ async def websocket_endpoint(websocket: WebSocket):
         ```
     - Run a command:
         ```json
-        {"action": "run", "args": {"command": "ls -l", "thought": "", "is_confirmed": "confirmed"}}
+        {"action": "run", "args": {"command": "ls -l", "thought": "", "confirmation_state": "confirmed"}}
         ```
     - Run an IPython command:
         ```json
@@ -295,6 +322,7 @@ async def websocket_endpoint(websocket: WebSocket):
         sid = str(uuid.uuid4())
         token = sign_token({'sid': sid}, config.jwt_secret)
 
+    logger.info(f'New session: {sid}')
     session = session_manager.add_or_restart_session(sid, websocket)
     await websocket.send_json({'token': token, 'status': 'ok'})
 
@@ -458,7 +486,7 @@ async def list_files(request: Request, path: str | None = None):
                 GitWildMatchPattern, observation.content.splitlines()
             )
         except Exception as e:
-            print(e)
+            logger.warning(e)
             return file_list
         file_list = [entry for entry in file_list if not spec.match_file(entry)]
         return file_list
@@ -737,11 +765,11 @@ async def security_api(request: Request):
 @app.get('/api/zip-directory')
 async def zip_current_workspace(request: Request):
     try:
-        logger.info('Zipping workspace')
+        logger.debug('Zipping workspace')
         runtime: Runtime = request.state.conversation.runtime
 
         path = runtime.config.workspace_mount_path_in_sandbox
-        zip_file_bytes = runtime.copy_from(path)
+        zip_file_bytes = await call_sync_from_async(runtime.copy_from, path)
         zip_stream = io.BytesIO(zip_file_bytes)  # Wrap to behave like a file stream
         response = StreamingResponse(
             zip_stream,
@@ -762,16 +790,16 @@ class AuthCode(BaseModel):
     code: str
 
 
-@app.post('/github/callback')
+@app.post('/api/github/callback')
 def github_callback(auth_code: AuthCode):
     # Prepare data for the token exchange request
     data = {
-        'client_id': os.getenv('GITHUB_CLIENT_ID'),
-        'client_secret': os.getenv('GITHUB_CLIENT_SECRET'),
+        'client_id': GITHUB_CLIENT_ID,
+        'client_secret': GITHUB_CLIENT_SECRET,
         'code': auth_code.code,
     }
 
-    logger.info(f'Exchanging code for token: {data}')
+    logger.debug('Exchanging code for GitHub token')
 
     headers = {'Accept': 'application/json'}
     response = requests.post(
@@ -779,6 +807,7 @@ def github_callback(auth_code: AuthCode):
     )
 
     if response.status_code != 200:
+        logger.error(f'Failed to exchange code for token: {response.text}')
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={'error': 'Failed to exchange code for token'},
@@ -798,4 +827,34 @@ def github_callback(auth_code: AuthCode):
     )
 
 
-app.mount('/', StaticFiles(directory='./frontend/build', html=True), name='dist')
+class User(BaseModel):
+    login: str  # GitHub login handle
+
+
+@app.post('/api/authenticate')
+def authenticate(user: User | None = None):
+    global GITHUB_USER_LIST
+
+    # Only check if waitlist is provided
+    if GITHUB_USER_LIST:
+        if user is None or user.login not in GITHUB_USER_LIST:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={'error': 'User not on waitlist'},
+            )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK, content={'message': 'User authenticated'}
+    )
+
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except Exception:
+            # FIXME: just making this HTTPException doesn't work for some reason
+            return await super().get_response('index.html', scope)
+
+
+app.mount('/', SPAStaticFiles(directory='./frontend/build', html=True), name='dist')

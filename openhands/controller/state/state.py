@@ -6,12 +6,12 @@ from typing import Any
 
 from openhands.controller.state.task import RootTask
 from openhands.core.logger import openhands_logger as logger
-from openhands.core.metrics import Metrics
 from openhands.core.schema import AgentState
 from openhands.events.action import (
     MessageAction,
 )
 from openhands.events.action.agent import AgentFinishAction
+from openhands.llm.metrics import Metrics
 from openhands.memory.history import ShortTermHistory
 from openhands.storage.files import FileStore
 
@@ -115,7 +115,7 @@ class State:
             pickled = base64.b64decode(encoded)
             state = pickle.loads(pickled)
         except Exception as e:
-            logger.error(f'Failed to restore state from session: {e}')
+            logger.warning(f'Failed to restore state from session: {e}')
             raise e
 
         # update state
