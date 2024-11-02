@@ -72,11 +72,15 @@ const isAgentStateChange = (
 
 export const clientLoader = async () => {
   const ghToken = localStorage.getItem("ghToken");
-
-  const isAuthed = await userIsAuthenticated(ghToken);
-  if (!isAuthed) {
+  try {
+    const isAuthed = await userIsAuthenticated();
+    if (!isAuthed) {
+      clearSession();
+      return redirect("/");
+    }
+  } catch (error) {
     clearSession();
-    return redirect("/waitlist");
+    return redirect("/");
   }
 
   const q = store.getState().initalQuery.initialQuery;
@@ -285,21 +289,21 @@ function App() {
 
   React.useEffect(() => {
     (async () => {
-      if (runtimeActive && token && importedProjectZip) {
+      if (runtimeActive && importedProjectZip) {
         // upload files action
         try {
           const blob = base64ToBlob(importedProjectZip);
           const file = new File([blob], "imported-project.zip", {
             type: blob.type,
           });
-          await OpenHands.uploadFiles(token, [file]);
+          await OpenHands.uploadFiles([file]);
           dispatch(setImportedProjectZip(null));
         } catch (error) {
           toast.error("Failed to upload project files.");
         }
       }
     })();
-  }, [runtimeActive, token, importedProjectZip]);
+  }, [runtimeActive, importedProjectZip]);
 
   const {
     isOpen: securityModalIsOpen,
@@ -310,7 +314,7 @@ function App() {
   return (
     <div className="flex flex-col h-full gap-3">
       <div className="flex h-full overflow-auto gap-3">
-        <Container className="w-[375px] max-h-full">
+        <Container className="w-[390px] max-h-full">
           <ChatInterface />
         </Container>
 
