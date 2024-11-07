@@ -113,7 +113,8 @@ class Runtime(FileEditRuntimeMixin):
         pass
 
     def log(self, level: str, message: str) -> None:
-        message = f'[runtime {self.sid}] {message}'
+        if hasattr(self, 'sid'):
+            message = f'[runtime {self.sid}] {message}'
         getattr(logger, level)(message, stacklevel=2)
 
     def send_status_message(self, message_id: str):
